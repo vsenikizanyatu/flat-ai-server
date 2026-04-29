@@ -25,7 +25,7 @@ def catch_all(path):
             return jsonify({"reply": "Помилка: Відсутній API ключ у запиті"}), 400
 
         # Запит до Google Gemini
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1/models/{model_name}:generateContent?key={api_key}"
         
         payload = {
             "contents": [{
