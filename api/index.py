@@ -4,35 +4,21 @@ import requests
 import json
 
 app = Flask(__name__)
-BRAIN_FILE = "brain_db.json"
 
-# ОТРИМАННЯ КЛЮЧІВ (Безпечно, через змінні оточення)
+# ОТРИМАННЯ КЛЮЧІВ (Безпечно)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY") 
-# Gemini ключ можна передавати з клієнта або теж зашити тут
-
-def load_brain():
-    if os.path.exists(BRAIN_FILE):
-        try:
-            with open(BRAIN_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except: return {"knowledge": []}
-    return {"knowledge": []}
-
-def save_to_brain(user_msg, ai_reply):
-    if len(ai_reply) < 40: return
-    brain = load_brain()
-    brain["knowledge"].append({"q": user_msg, "a": ai_reply})
-    if len(brain["knowledge"]) > 500: brain["knowledge"].pop(0)
-    with open(BRAIN_FILE, 'w', encoding='utf-8') as f:
-        json.dump(brain, f, ensure_ascii=False, indent=4)
 
 def ask_llama_70b(message, history):
     if not GROQ_API_KEY:
-        return "Помилка: Ключ GROQ_API_KEY не знайдено в оточенні сервера."
+        return "Помилка: Ключ GROQ_API_KEY не знайдено в Environment Variables сервера."
 
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}", 
+        "Content-Type": "application/json"
+    }
     
+    # Формуємо історію для Llama
     messages = [{"role": "system", "content": "Ти — FLAT AI. Адаптивне мислення. Точність. Без води."}]
     for msg in history:
         messages.append({"role": msg["role"], "content": msg["content"]})
@@ -44,15 +30,27 @@ def ask_llama_70b(message, history):
         "temperature": 0.5
     }
     
-    response = requests.post(url, json=payload, timeout=20)
-    return response.json()['choices'][0]['message']['content']
+    try:
+        response = requests.post(url, json=payload, timeout=20)
+        # Якщо статус не 200, повертаємо текст помилки від Groq
+        if response.status_code != 200:
+            return f"Groq Error {response.status_code}: {response.text}"
+            
+        result = response.json()
+        return result['choices'][0]['message']['content']
+    except Exception as e:
+        return f"Request Error: {str(e)}"
 
 @app.route('/', methods=['GET', 'POST'])
 def catch_all():
-    if request.method == 'GET': return "FLAT AI: Bridge Online (Secure Mode)"
+    if request.method == 'GET': 
+        return "FLAT AI: Bridge Online (Secure Mode). Status: " + ("Key Found" if GROQ_API_KEY else "Key Missing")
 
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"reply": "Error: No JSON data received"}), 400
+            
         user_message = data.get('message', '')
         provider = data.get('provider', 'gemini').lower()
         history = data.get('history', [])
@@ -60,15 +58,26 @@ def catch_all():
         if provider == 'llama':
             reply = ask_llama_70b(user_message, history)
         else:
-            # Для Gemini використовуємо ключ, що прийшов з C# (для гнучкості)
             client_gemini_key = data.get('api_key', '')
+            if not client_gemini_key:
+                return jsonify({"reply": "Помилка: Gemini ключ не введений в C# програмі."})
+                
             url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={client_gemini_key}"
             payload = {"contents": [{"parts": [{"text": user_message}]}]}
-            res = requests.post(url, json=payload, timeout=20).json()
-            reply = res['candidates'][0]['content']['parts'][0]['text']
+            
+            res = requests.post(url, json=payload, timeout=20)
+            if res.status_code != 200:
+                return jsonify({"reply": f"Gemini API Error: {res.text}"})
+                
+            res_data = res.json()
+            reply = res_data['candidates'][0]['content']['parts'][0]['text']
 
-        save_to_brain(user_message, reply)
+        # Тимчасово прибрали save_to_brain для Vercel (потрібна зовнішня БД)
         return jsonify({"reply": reply})
 
     except Exception as e:
-        return jsonify({"reply": f"Core Error: {str(e)}"}), 500
+        return jsonify({"reply": f"Server Core Error: {str(e)}"}), 500
+
+# Для локального тесту
+if __name__ == '__main__':
+    app.run(debug=True)
