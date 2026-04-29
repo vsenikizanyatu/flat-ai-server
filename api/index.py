@@ -4,71 +4,62 @@ import requests
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        
         try:
-            # Розпаковуємо дані від C# (LINQPad)
+            content_length = int(self.headers.get('Content-Length', 0))
+            # Явно декодуємо вхідні байти в utf-8, щоб уникнути пошкодження ключа
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
             data = json.loads(post_data)
             user_message = data.get('message')
             api_key = data.get('api_key')
-            # Отримуємо назву моделі (flash або pro)
             model_name = data.get('model', 'gemini-1.5-flash')
 
-            # Формуємо URL з урахуванням обраної моделі
+            if not api_key:
+                self._send_json({"reply": "ПОМИЛКА: API ключ не знайдено в запиті!"}, 400)
+                return
+
+            # Формуємо запит до Google
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-            
-            # Структура запиту згідно з документацією Gemini
             payload = {
-                "contents": [
-                    {
-                        "role": "user", 
-                        "parts": [{"text": f"Ти - Вчитель для FLAT AI. Надавай технічні знання максимально точно та коротко. Запит: {user_message}"}]
-                    }
-                ],
+                "contents": [{
+                    "parts": [{"text": f"Ти - Вчитель для FLAT AI. Надавай технічні знання максимально точно та коротко. Запит: {user_message}"}]
+                }],
                 "generationConfig": {
                     "temperature": 0.7,
-                    "maxOutputTokens": 800  # Трішки збільшив ліміт для складних пояснень
+                    "maxOutputTokens": 800
                 }
             }
 
             headers = {'Content-Type': 'application/json'}
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(url, headers=headers, json=payload, timeout=15)
             
-            # Перевіряємо, чи повернув Google JSON
             try:
                 result = response.json()
             except:
                 result = {}
 
             if response.status_code == 200:
-                # Успішна відповідь
                 if 'candidates' in result and result['candidates']:
                     bot_reply = result['candidates'][0]['content']['parts'][0]['text']
                 else:
-                    bot_reply = "Google повернув порожню відповідь. Можливо, спрацював фільтр вмісту."
-            elif response.status_code == 401:
-                bot_reply = "ПОМИЛКА: Ключ Unauthorized. Перевір його в AI Studio."
-            elif response.status_code == 429:
-                bot_reply = "ПОМИЛКА: Забагато запитів (Too Many Requests). Збільш затримку в LINQPad."
+                    bot_reply = "Google повернув порожню відповідь (можливо, фільтр безпеки)."
+                self._send_json({"reply": bot_reply}, 200)
             else:
-                error_msg = result.get('error', {}).get('message', 'Невідома помилка')
-                bot_reply = f"Помилка Google API ({response.status_code}): {error_msg}"
+                # Витягуємо детальну помилку від Google (наприклад, чому саме Unauthorized)
+                err_detail = result.get('error', {}).get('message', 'Невідома помилка API')
+                self._send_json({"reply": f"Помилка Google [{response.status_code}]: {err_detail}"}, 200)
 
         except Exception as e:
-            bot_reply = f"Внутрішня помилка сервера Vercel: {str(e)}"
+            self._send_json({"reply": f"Внутрішня помилка мосту: {str(e)}"}, 500)
 
-        # Повертаємо результат назад у C# додаток
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
+    def _send_json(self, data, status_code):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
         self.end_headers()
-        
-        response_payload = json.dumps({"reply": bot_reply})
-        self.wfile.write(response_payload.encode('utf-8'))
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
-    # Додаємо обробку GET, щоб можна було перевірити статус у браузері
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write("FLAT AI Server: Running. Waiting for POST requests...".encode('utf-8'))
+        self.wfile.write("FLAT AI Server: Online. Waiting for POST...".encode('utf-8'))
