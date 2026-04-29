@@ -1,65 +1,58 @@
-from http.server import BaseHTTPRequestHandler
-import json
+from flask import Flask, request, jsonify
 import requests
+import json
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            # Явно декодуємо вхідні байти в utf-8, щоб уникнути пошкодження ключа
-            post_data = self.rfile.read(content_length).decode('utf-8')
-            
-            data = json.loads(post_data)
-            user_message = data.get('message')
-            api_key = data.get('api_key')
-            model_name = data.get('model', 'gemini-1.5-flash')
+app = Flask(__name__)
 
-            if not api_key:
-                self._send_json({"reply": "ПОМИЛКА: API ключ не знайдено в запиті!"}, 400)
-                return
+@app.route('/api', methods=['POST'])
+def handle_post():
+    try:
+        # Flask сам забирає JSON і декодує його
+        data = request.get_json()
+        if not data:
+            return jsonify({"reply": "Помилка: Порожній JSON"}), 400
 
-            # Формуємо запит до Google
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-            payload = {
-                "contents": [{
-                    "parts": [{"text": f"Ти - Вчитель для FLAT AI. Надавай технічні знання максимально точно та коротко. Запит: {user_message}"}]
-                }],
-                "generationConfig": {
-                    "temperature": 0.7,
-                    "maxOutputTokens": 800
-                }
+        user_message = data.get('message')
+        api_key = data.get('api_key')
+        model_name = data.get('model', 'gemini-1.5-flash')
+
+        if not api_key:
+            return jsonify({"reply": "Помилка: Відсутній API Key"}), 401
+
+        # Формуємо запит до Gemini
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": f"Ти - Вчитель для FLAT AI. Надавай технічні знання максимально точно та коротко. Запит: {user_message}"}]
+            }],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 800
             }
+        }
 
-            headers = {'Content-Type': 'application/json'}
-            response = requests.post(url, headers=headers, json=payload, timeout=15)
-            
-            try:
-                result = response.json()
-            except:
-                result = {}
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        
+        result = response.json()
 
-            if response.status_code == 200:
-                if 'candidates' in result and result['candidates']:
-                    bot_reply = result['candidates'][0]['content']['parts'][0]['text']
-                else:
-                    bot_reply = "Google повернув порожню відповідь (можливо, фільтр безпеки)."
-                self._send_json({"reply": bot_reply}, 200)
+        if response.status_code == 200:
+            if 'candidates' in result and result['candidates']:
+                bot_reply = result['candidates'][0]['content']['parts'][0]['text']
             else:
-                # Витягуємо детальну помилку від Google (наприклад, чому саме Unauthorized)
-                err_detail = result.get('error', {}).get('message', 'Невідома помилка API')
-                self._send_json({"reply": f"Помилка Google [{response.status_code}]: {err_detail}"}, 200)
+                bot_reply = "Google повернув порожню відповідь (фільтр безпеки)."
+            return jsonify({"reply": bot_reply})
+        else:
+            err_msg = result.get('error', {}).get('message', 'API Error')
+            return jsonify({"reply": f"Помилка Google [{response.status_code}]: {err_msg}"})
 
-        except Exception as e:
-            self._send_json({"reply": f"Внутрішня помилка мосту: {str(e)}"}, 500)
+    except Exception as e:
+        return jsonify({"reply": f"Внутрішня помилка мосту: {str(e)}"}), 500
 
-    def _send_json(self, data, status_code):
-        self.send_response(status_code)
-        self.send_header('Content-type', 'application/json; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+@app.route('/api', methods=['GET'])
+def handle_get():
+    return "FLAT AI Bridge: Flask is Running"
 
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain; charset=utf-8')
-        self.end_headers()
-        self.wfile.write("FLAT AI Server: Online. Waiting for POST...".encode('utf-8'))
+# Важливо для Vercel
+app = app
