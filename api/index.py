@@ -1,11 +1,10 @@
-import os
 import json
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── KV (не критично) ─────────────────────────────────────────────────────────
+# ── KV ───────────────────────────────────────────────────────────────────────
 try:
     from vercel_kv import KV
     kv = KV()
@@ -24,14 +23,17 @@ TRAINING_TOPICS = {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
+# ПРОВАЙДЕРИ
+# ════════════════════════════════════════════════════════════════════════════
+
 def call_gemini(api_key: str, messages: list, system_prompt: str = "") -> str:
     if not api_key:
         raise ValueError("Gemini API key порожній")
 
-    # v1beta — актуальний endpoint
+    # ✅ Актуальна модель 2025
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={api_key}"
+        f"gemini-2.0-flash:generateContent?key={api_key}"
     )
 
     contents = []
@@ -46,7 +48,6 @@ def call_gemini(api_key: str, messages: list, system_prompt: str = "") -> str:
             contents.append({"role": role, "parts": [{"text": text}]})
 
     resp = requests.post(url, json={"contents": contents}, timeout=25)
-
     if not resp.ok:
         raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:400]}")
 
@@ -72,7 +73,6 @@ def call_claude(api_key: str, messages: list, system_prompt: str = "") -> str:
         for m in messages
         if m.get("role") in ("user", "assistant") and m.get("content", "").strip()
     ]
-    # Claude вимагає перше повідомлення — user
     if not filtered or filtered[0]["role"] != "user":
         filtered.insert(0, {"role": "user", "content": "Привіт"})
 
@@ -82,7 +82,6 @@ def call_claude(api_key: str, messages: list, system_prompt: str = "") -> str:
 
     resp = requests.post("https://api.anthropic.com/v1/messages",
                          headers=headers, json=payload, timeout=25)
-
     if not resp.ok:
         raise RuntimeError(f"Claude HTTP {resp.status_code}: {resp.text[:400]}")
 
@@ -99,7 +98,21 @@ def save_to_brain(entry: dict):
         pass
 
 
+def read_brain(limit: int = 10) -> list:
+    """Читає останні записи з Brain DB."""
+    if not KV_AVAILABLE:
+        return []
+    try:
+        raw = kv.lrange("flat_ai_brain", 0, limit - 1)
+        return [json.loads(r) for r in raw]
+    except Exception:
+        return []
+
+
 # ════════════════════════════════════════════════════════════════════════════
+# МАРШРУТИ
+# ════════════════════════════════════════════════════════════════════════════
+
 @app.route("/", methods=["GET", "POST"])
 def handle_request():
     if request.method == "GET":
@@ -136,16 +149,85 @@ def handle_request():
     except ValueError as e:
         return jsonify({"reply": f"Конфіг: {str(e)}"}), 400
     except RuntimeError as e:
-        # Містить HTTP код та тіло відповіді від провайдера
         return jsonify({"reply": str(e)}), 502
     except requests.exceptions.ConnectionError as e:
-        return jsonify({"reply": f"Помилка з'єднання з провайдером: {str(e)[:150]}"}), 502
+        return jsonify({"reply": f"Помилка з'єднання: {str(e)[:150]}"}), 502
     except requests.exceptions.Timeout:
         return jsonify({"reply": "Timeout: провайдер не відповів за 25 сек"}), 502
     except Exception as e:
         return jsonify({"reply": f"{type(e).__name__}: {str(e)[:200]}"}), 500
 
 
+# ── FLAT AI — власний інтелект на основі Brain DB ────────────────────────────
+@app.route("/flat", methods=["POST"])
+def flat_ai():
+    """
+    FLAT AI відповідає сам, використовуючи:
+    - Накопичені знання з Brain DB (останні записи)
+    - Один із доступних провайдерів як "двигун"
+    - Власний системний промпт з характером FLAT AI
+    """
+    try:
+        data       = request.get_json(force=True, silent=True) or {}
+        user_msg   = data.get("message", "").strip()
+        gemini_key = data.get("gemini_key", "").strip()
+        claude_key = data.get("claude_key", "").strip()
+        history    = data.get("history", [])
+
+        if not user_msg:
+            return jsonify({"reply": "Порожнє повідомлення"}), 400
+
+        # Читаємо знання з Brain DB
+        brain_entries = read_brain(limit=8)
+        brain_context = ""
+        if brain_entries:
+            examples = []
+            for e in brain_entries[:5]:
+                p = e.get("prompt", "")[:100]
+                r = e.get("reply",  "")[:150]
+                if p and r:
+                    examples.append(f"Q: {p}\nA: {r}")
+            if examples:
+                brain_context = (
+                    "\n\n[НАКОПИЧЕНІ ЗНАННЯ З BRAIN DB — використовуй як контекст]:\n"
+                    + "\n---\n".join(examples)
+                )
+
+        flat_system = (
+            "Ти — FLAT AI, автономна нейронна мережа. "
+            "Твої риси: аналітичність, стислість, адаптивне мислення. "
+            "Ти навчаєшся від Gemini та Claude і синтезуєш їхні знання. "
+            "Відповідай від першої особи як FLAT AI. "
+            "Використовуй термін 'Адаптивне мислення' коли доречно. "
+            "Відповідай українською, стисло (до 150 слів)."
+            + brain_context
+        )
+
+        messages = [m for m in history if m.get("role") in ("user", "assistant")]
+        messages.append({"role": "user", "content": user_msg})
+
+        # Пробуємо Claude, якщо немає — Gemini
+        if claude_key:
+            reply = call_claude(claude_key, messages, flat_system)
+            engine = "claude"
+        elif gemini_key:
+            reply = call_gemini(gemini_key, messages, flat_system)
+            engine = "gemini"
+        else:
+            return jsonify({"reply": "Немає жодного API ключа. Додай Gemini або Claude key."}), 400
+
+        save_to_brain({"prompt": user_msg, "reply": reply, "provider": "flat_ai", "engine": engine})
+        return jsonify({"reply": reply, "engine": engine})
+
+    except ValueError as e:
+        return jsonify({"reply": f"Конфіг: {str(e)}"}), 400
+    except RuntimeError as e:
+        return jsonify({"reply": str(e)}), 502
+    except Exception as e:
+        return jsonify({"reply": f"{type(e).__name__}: {str(e)[:200]}"}), 500
+
+
+# ── ТРЕНУВАННЯ ───────────────────────────────────────────────────────────────
 @app.route("/train", methods=["POST"])
 def train():
     try:
@@ -163,8 +245,9 @@ def train():
         )
         eval_system = (
             "Ти — FLAT AI. Аналізуй відповідь вчителя: виділи ключові патерни, "
-            "оціни якість (1-10), запропонуй одне покращення. "
-            "Використовуй 'Адаптивне мислення'. Відповідь до 200 слів."
+            "оціни якість (1–10), запропонуй одне покращення. "
+            "Адаптивне мислення: знайди зв'язки з попередніми знаннями. "
+            "Відповідь до 150 слів."
         )
 
         results = {}
@@ -173,25 +256,25 @@ def train():
             try:
                 t = call_gemini(gemini_key, [{"role": "user", "content": task_prompt}])
                 e = call_gemini(gemini_key,
-                                [{"role": "user", "content": f"Відповідь вчителя:\n{t}\n\nПроаналізуй."}],
-                                eval_system)
+                    [{"role": "user", "content": f"Відповідь вчителя:\n{t}\n\nПроаналізуй."}],
+                    eval_system)
                 results["gemini"] = {"teacher_reply": t, "flat_eval": e}
-                save_to_brain({"type": "training", "topic": topic_key, "teacher": "gemini",
-                               "reply": t, "eval": e})
-            except Exception as e:
-                results["gemini"] = str(e)[:200]
+                save_to_brain({"type": "training", "topic": topic_key,
+                               "teacher": "gemini", "reply": t, "eval": e})
+            except Exception as ex:
+                results["gemini"] = str(ex)[:200]
 
         if teacher in ("claude", "both"):
             try:
                 t = call_claude(claude_key, [{"role": "user", "content": task_prompt}])
                 e = call_claude(claude_key,
-                                [{"role": "user", "content": f"Відповідь вчителя:\n{t}\n\nПроаналізуй."}],
-                                eval_system)
+                    [{"role": "user", "content": f"Відповідь вчителя:\n{t}\n\nПроаналізуй."}],
+                    eval_system)
                 results["claude"] = {"teacher_reply": t, "flat_eval": e}
-                save_to_brain({"type": "training", "topic": topic_key, "teacher": "claude",
-                               "reply": t, "eval": e})
-            except Exception as e:
-                results["claude"] = str(e)[:200]
+                save_to_brain({"type": "training", "topic": topic_key,
+                               "teacher": "claude", "reply": t, "eval": e})
+            except Exception as ex:
+                results["claude"] = str(ex)[:200]
 
         return jsonify({"results": results, "topic": topic_desc, "iteration": iteration})
 
@@ -204,8 +287,7 @@ def view_brain():
     if not KV_AVAILABLE:
         return jsonify({"error": "KV недоступний"}), 503
     try:
-        raw     = kv.lrange("flat_ai_brain", 0, 49)
-        entries = [json.loads(r) for r in raw]
+        entries = read_brain(50)
         return jsonify({"count": len(entries), "entries": entries})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
