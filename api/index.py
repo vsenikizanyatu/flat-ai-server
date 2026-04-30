@@ -4,7 +4,6 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── KV ───────────────────────────────────────────────────────────────────────
 try:
     from vercel_kv import KV
     kv = KV()
@@ -26,21 +25,22 @@ TRAINING_TOPICS = {
 # ПРОВАЙДЕРИ
 # ════════════════════════════════════════════════════════════════════════════
 
+class QuotaError(Exception):
+    """429 від провайдера — потрібен fallback."""
+    pass
+
 def call_gemini(api_key: str, messages: list, system_prompt: str = "") -> str:
     if not api_key:
         raise ValueError("Gemini API key порожній")
 
-    # ✅ Актуальна модель 2025
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-2.0-flash:generateContent?key={api_key}"
     )
-
     contents = []
     if system_prompt:
         contents.append({"role": "user",  "parts": [{"text": system_prompt}]})
         contents.append({"role": "model", "parts": [{"text": "Зрозумів."}]})
-
     for m in messages:
         role = "model" if m.get("role") == "assistant" else "user"
         text = m.get("content", "")
@@ -48,13 +48,15 @@ def call_gemini(api_key: str, messages: list, system_prompt: str = "") -> str:
             contents.append({"role": role, "parts": [{"text": text}]})
 
     resp = requests.post(url, json={"contents": contents}, timeout=25)
+
+    if resp.status_code == 429:
+        raise QuotaError("Gemini: квота вичерпана (429). Перемикаюсь на Claude...")
     if not resp.ok:
-        raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:400]}")
+        raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
 
     data = resp.json()
     if "candidates" not in data or not data["candidates"]:
-        raise RuntimeError(f"Gemini: порожня відповідь. Raw: {str(data)[:300]}")
-
+        raise RuntimeError(f"Gemini: порожня відповідь. Raw: {str(data)[:200]}")
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
@@ -67,7 +69,6 @@ def call_claude(api_key: str, messages: list, system_prompt: str = "") -> str:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-
     filtered = [
         {"role": m["role"], "content": m["content"]}
         for m in messages
@@ -82,10 +83,41 @@ def call_claude(api_key: str, messages: list, system_prompt: str = "") -> str:
 
     resp = requests.post("https://api.anthropic.com/v1/messages",
                          headers=headers, json=payload, timeout=25)
-    if not resp.ok:
-        raise RuntimeError(f"Claude HTTP {resp.status_code}: {resp.text[:400]}")
 
+    if resp.status_code == 429:
+        raise QuotaError("Claude: квота вичерпана (429).")
+    if not resp.ok:
+        raise RuntimeError(f"Claude HTTP {resp.status_code}: {resp.text[:300]}")
     return resp.json()["content"][0]["text"]
+
+
+def call_with_fallback(provider: str, gemini_key: str, claude_key: str,
+                       messages: list, system_prompt: str = "") -> tuple[str, str]:
+    """
+    Викликає провайдера. Якщо 429 — автоматично перемикається на інший.
+    Повертає (reply, actual_provider).
+    """
+    primary   = provider
+    secondary = "claude" if provider == "gemini" else "gemini"
+
+    try:
+        if primary == "gemini":
+            return call_gemini(gemini_key, messages, system_prompt), "gemini"
+        else:
+            return call_claude(claude_key, messages, system_prompt), "claude"
+
+    except QuotaError as qe:
+        # Fallback на інший провайдер
+        fallback_note = str(qe)
+        try:
+            if secondary == "claude":
+                reply = call_claude(claude_key, messages, system_prompt)
+            else:
+                reply = call_gemini(gemini_key, messages, system_prompt)
+            # Додаємо примітку про переключення
+            return f"[⚡ Fallback на {secondary.upper()}]\n{reply}", secondary
+        except Exception as e2:
+            raise RuntimeError(f"{fallback_note} | {secondary} також недоступний: {str(e2)[:150]}")
 
 
 def save_to_brain(entry: dict):
@@ -99,7 +131,6 @@ def save_to_brain(entry: dict):
 
 
 def read_brain(limit: int = 10) -> list:
-    """Читає останні записи з Brain DB."""
     if not KV_AVAILABLE:
         return []
     try:
@@ -136,37 +167,27 @@ def handle_request():
         messages = [m for m in history if m.get("role") in ("user", "assistant")]
         messages.append({"role": "user", "content": user_msg})
 
-        if provider == "gemini":
-            reply = call_gemini(gemini_key, messages, system_prompt)
-        elif provider == "claude":
-            reply = call_claude(claude_key, messages, system_prompt)
-        else:
+        if provider not in ("gemini", "claude"):
             return jsonify({"reply": f"Невідомий провайдер: {provider}"}), 400
 
-        save_to_brain({"prompt": user_msg, "reply": reply, "provider": provider})
-        return jsonify({"reply": reply})
+        reply, actual = call_with_fallback(provider, gemini_key, claude_key, messages, system_prompt)
+
+        save_to_brain({"prompt": user_msg, "reply": reply,
+                       "provider": actual, "requested": provider})
+        return jsonify({"reply": reply, "provider": actual})
 
     except ValueError as e:
         return jsonify({"reply": f"Конфіг: {str(e)}"}), 400
     except RuntimeError as e:
         return jsonify({"reply": str(e)}), 502
-    except requests.exceptions.ConnectionError as e:
-        return jsonify({"reply": f"Помилка з'єднання: {str(e)[:150]}"}), 502
     except requests.exceptions.Timeout:
         return jsonify({"reply": "Timeout: провайдер не відповів за 25 сек"}), 502
     except Exception as e:
         return jsonify({"reply": f"{type(e).__name__}: {str(e)[:200]}"}), 500
 
 
-# ── FLAT AI — власний інтелект на основі Brain DB ────────────────────────────
 @app.route("/flat", methods=["POST"])
 def flat_ai():
-    """
-    FLAT AI відповідає сам, використовуючи:
-    - Накопичені знання з Brain DB (останні записи)
-    - Один із доступних провайдерів як "двигун"
-    - Власний системний промпт з характером FLAT AI
-    """
     try:
         data       = request.get_json(force=True, silent=True) or {}
         user_msg   = data.get("message", "").strip()
@@ -177,7 +198,6 @@ def flat_ai():
         if not user_msg:
             return jsonify({"reply": "Порожнє повідомлення"}), 400
 
-        # Читаємо знання з Brain DB
         brain_entries = read_brain(limit=8)
         brain_context = ""
         if brain_entries:
@@ -189,35 +209,31 @@ def flat_ai():
                     examples.append(f"Q: {p}\nA: {r}")
             if examples:
                 brain_context = (
-                    "\n\n[НАКОПИЧЕНІ ЗНАННЯ З BRAIN DB — використовуй як контекст]:\n"
-                    + "\n---\n".join(examples)
+                    "\n\n[ЗНАННЯ З BRAIN DB]:\n" + "\n---\n".join(examples)
                 )
 
         flat_system = (
             "Ти — FLAT AI, автономна нейронна мережа. "
             "Твої риси: аналітичність, стислість, адаптивне мислення. "
-            "Ти навчаєшся від Gemini та Claude і синтезуєш їхні знання. "
-            "Відповідай від першої особи як FLAT AI. "
-            "Використовуй термін 'Адаптивне мислення' коли доречно. "
-            "Відповідай українською, стисло (до 150 слів)."
+            "Відповідай від першої особи як FLAT AI, українською, до 150 слів."
             + brain_context
         )
 
         messages = [m for m in history if m.get("role") in ("user", "assistant")]
         messages.append({"role": "user", "content": user_msg})
 
-        # Пробуємо Claude, якщо немає — Gemini
+        # Пріоритет: Claude > Gemini (Claude стабільніший)
         if claude_key:
-            reply = call_claude(claude_key, messages, flat_system)
-            engine = "claude"
+            primary = "claude"
         elif gemini_key:
-            reply = call_gemini(gemini_key, messages, flat_system)
-            engine = "gemini"
+            primary = "gemini"
         else:
-            return jsonify({"reply": "Немає жодного API ключа. Додай Gemini або Claude key."}), 400
+            return jsonify({"reply": "Немає жодного API ключа."}), 400
 
-        save_to_brain({"prompt": user_msg, "reply": reply, "provider": "flat_ai", "engine": engine})
-        return jsonify({"reply": reply, "engine": engine})
+        reply, actual = call_with_fallback(primary, gemini_key, claude_key, messages, flat_system)
+
+        save_to_brain({"prompt": user_msg, "reply": reply, "provider": "flat_ai", "engine": actual})
+        return jsonify({"reply": reply, "engine": actual})
 
     except ValueError as e:
         return jsonify({"reply": f"Конфіг: {str(e)}"}), 400
@@ -227,7 +243,6 @@ def flat_ai():
         return jsonify({"reply": f"{type(e).__name__}: {str(e)[:200]}"}), 500
 
 
-# ── ТРЕНУВАННЯ ───────────────────────────────────────────────────────────────
 @app.route("/train", methods=["POST"])
 def train():
     try:
@@ -241,40 +256,37 @@ def train():
         topic_desc  = TRAINING_TOPICS.get(topic_key, topic_key)
         task_prompt = (
             f"Ітерація {iteration}. Тема: {topic_desc}. "
-            "Дай конкретний приклад або задачу з розбором. Чіткий висновок в кінці."
+            "Дай конкретний приклад або задачу з розбором. Висновок в кінці."
         )
         eval_system = (
-            "Ти — FLAT AI. Аналізуй відповідь вчителя: виділи ключові патерни, "
-            "оціни якість (1–10), запропонуй одне покращення. "
-            "Адаптивне мислення: знайди зв'язки з попередніми знаннями. "
-            "Відповідь до 150 слів."
+            "Ти — FLAT AI. Аналізуй відповідь вчителя: ключові патерни, "
+            "оцінка 1–10, одне покращення. Адаптивне мислення. До 150 слів."
         )
 
         results = {}
 
-        if teacher in ("gemini", "both"):
-            try:
-                t = call_gemini(gemini_key, [{"role": "user", "content": task_prompt}])
-                e = call_gemini(gemini_key,
-                    [{"role": "user", "content": f"Відповідь вчителя:\n{t}\n\nПроаналізуй."}],
-                    eval_system)
-                results["gemini"] = {"teacher_reply": t, "flat_eval": e}
-                save_to_brain({"type": "training", "topic": topic_key,
-                               "teacher": "gemini", "reply": t, "eval": e})
-            except Exception as ex:
-                results["gemini"] = str(ex)[:200]
+        teachers = ["gemini", "claude"] if teacher == "both" else [teacher]
 
-        if teacher in ("claude", "both"):
+        for t in teachers:
             try:
-                t = call_claude(claude_key, [{"role": "user", "content": task_prompt}])
-                e = call_claude(claude_key,
-                    [{"role": "user", "content": f"Відповідь вчителя:\n{t}\n\nПроаналізуй."}],
+                task_reply, used = call_with_fallback(
+                    t, gemini_key, claude_key,
+                    [{"role": "user", "content": task_prompt}])
+
+                eval_reply, _ = call_with_fallback(
+                    t, gemini_key, claude_key,
+                    [{"role": "user",
+                      "content": f"Відповідь вчителя:\n{task_reply}\n\nПроаналізуй."}],
                     eval_system)
-                results["claude"] = {"teacher_reply": t, "flat_eval": e}
+
+                results[t] = {"teacher_reply": task_reply,
+                               "flat_eval": eval_reply,
+                               "engine": used}
                 save_to_brain({"type": "training", "topic": topic_key,
-                               "teacher": "claude", "reply": t, "eval": e})
+                               "teacher": t, "engine": used,
+                               "reply": task_reply, "eval": eval_reply})
             except Exception as ex:
-                results["claude"] = str(ex)[:200]
+                results[t] = str(ex)[:200]
 
         return jsonify({"results": results, "topic": topic_desc, "iteration": iteration})
 
